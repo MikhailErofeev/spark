@@ -23,6 +23,7 @@ import java.util.concurrent.{Executors, ExecutorService, Future, TimeUnit}
 import java.util.zip.{ZipEntry, ZipOutputStream}
 
 import scala.collection.mutable
+import scala.io.Source
 import scala.xml.Node
 
 import com.google.common.io.ByteStreams
@@ -88,6 +89,9 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
   // Interval between each cleaner checks for event logs to delete
   private val CLEAN_INTERVAL_S = conf.getTimeAsSeconds("spark.history.fs.cleaner.interval", "1d")
+
+  // Buffer size for strings inside events reader
+  private val BUFFER_SIZE = conf.getInt("spark.history.fs.buffer.size", Source.DefaultBufSize)
 
   // Number of threads used to replay event logs.
   private val NUM_PROCESSING_THREADS = conf.getInt(SPARK_HISTORY_FS_NUM_REPLAY_THREADS,
@@ -236,7 +240,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
     try {
       applications.get(appId).flatMap { appInfo =>
         appInfo.attempts.find(_.attemptId == attemptId).flatMap { attempt =>
-          val replayBus = new ReplayListenerBus()
+          val replayBus = new ReplayListenerBus(BUFFER_SIZE)
           val ui = {
             val conf = this.conf.clone()
             val appSecManager = new SecurityManager(conf)
@@ -449,7 +453,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
 
       val appCompleted = isApplicationCompleted(fileStatus)
 
-      val appListener = replay(fileStatus, appCompleted, new ReplayListenerBus(), eventsFilter)
+      val replayListenerBus = new ReplayListenerBus(BUFFER_SIZE)
+      val appListener = replay(fileStatus, appCompleted, replayListenerBus, eventsFilter)
 
       // Without an app ID, new logs will render incorrectly in the listing page, so do not list or
       // try to show their UI.
@@ -625,6 +630,7 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
       bus: ReplayListenerBus,
       eventsFilter: ReplayEventsFilter = SELECT_ALL_FILTER): ApplicationEventListener = {
     val logPath = eventLog.getPath()
+    val replayStart = System.currentTimeMillis()
     logInfo(s"Replaying log path: $logPath")
     // Note that the eventLog may have *increased* in size since when we grabbed the filestatus,
     // and when we read the file here.  That is OK -- it may result in an unnecessary refresh
@@ -639,6 +645,8 @@ private[history] class FsHistoryProvider(conf: SparkConf, clock: Clock)
       bus.replay(logInput, logPath.toString, !appCompleted, eventsFilter)
       appListener
     } finally {
+      val replayTimeS = (System.currentTimeMillis() - replayStart) / 1000.0
+      logInfo(s"Done replaying log path $logPath in " + replayTimeS + " s")
       logInput.close()
     }
   }
